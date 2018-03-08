@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 #TEST 
 #   curl http://127.0.0.1:8766 | python mp4streamtest.py  -
 #LIVE
@@ -73,6 +74,9 @@ class Source:
     def runmp4(self):
         DataChunkSize = 10000
 
+        #See this http://fomori.org/blog/?p=1213
+        # for tuning more
+        #-x264opts crf=20:vbv-maxrate=3000:vbv-bufsize=100:intra-refresh=1:slice-max-size=1500:keyint=30:ref=1
         if self.hostsocket is None:
             FNULL = open(os.devnull, 'w')
 
@@ -125,8 +129,6 @@ class Source:
                 stdoutdata = subprocfx[1](DataChunkSize)
             except:
                 break
-            if len(stdoutdata) > 0:
-                print "mp4 received",len(stdoutdata)
             # append to p arser
             ss.data += stdoutdata
             #print "MAIN read",len(stdoutdata)
@@ -223,7 +225,6 @@ class Source:
                 print "jpg error"
                 break
             if len(stdoutdata) != 0:
-                print "mjpeg data",len(stdoutdata)
                 # append to p arser
                 ss.data += stdoutdata
                 for s in ss.ondata():
@@ -343,7 +344,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-Length', "%d" % n)
         elif self.path == "/mjpeg":
             self.send_response(200) # 200 OK http response
-            self.send_header('Content-type', 'multipart/x-mixed-replace;boundary=--BOUNDARY')
+            self.send_header('Content-type', 'multipart/x-mixed-replace;boundary=BOUNDARY')
         else:
             self.send_response(404)
         self.send_header('Cache-Control', 'no-cache')
@@ -429,14 +430,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 except:
                     a = ""
                     if sourceJ.done:
-                        self.wfile.write("----BOUNDARY"+"Content-Type: text/plain\r\nContent-Length: 0\r\n\r\n")
+                        #Note that the encapsulation boundary must occur at the beginning of a line, i.e., following a CRLF, and that that initial CRLF is considered to be part of the encapsulation boundary rather than part of the preceding part. 
+                        self.wfile.write("\r\n--BOUNDARY\r\n\r\n")
                         break
                     else:
                         continue
                 #print "HANDLER write",len(a)
                 if len(a) != 0:
                     try:
-                        self.wfile.write("----BOUNDARY"+"Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(a))
+                        #Note that the encapsulation boundary must occur at the beginning of a line, i.e., following a CRLF, and that that initial CRLF is considered to be part of the encapsulation boundary rather than part of the preceding part. 
+                        self.wfile.write("\r\n--BOUNDARY\r\n"+"Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(a))
                         self.wfile.write(a)
                     except:
                         print "HANDLER network exception",self.id
