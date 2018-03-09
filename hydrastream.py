@@ -5,8 +5,7 @@
 #   ffplay http://127.0.0.1:8766
 #Web
 #   http://download.tsi.telecom-paristech.fr/gpac/mp4box.js/
-#
-#https://blog.carlmjohnson.net/post/on-using-go-channels-like-python-generators/
+
 #
 #Example: 
 
@@ -353,9 +352,16 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._writeheaders()
     def do_OPTIONS(self):
+        #https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
         print("HANDLER OPTIONS handling",self.path)
         print("HANDLER headers",self.headers)
-        self._writeheaders()
+        self.send_response(200)
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Allow', 'GET')
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","HEAD, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type")
+        self.end_headers()
 
     def write_chunk(self,chunk):
         tosend = b'%X\r\n'%(len(chunk))
@@ -451,7 +457,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             sourceJ.dellistener(self)
             print("HANDLER removed",self.id)
         else:
-            self.send_error(404)
+            k = os.path.join(os.getcwd(),self.path[1:])
+            if os.path.isfile(k):
+                v = open(k,"rb").read()
+                n = len(v)
+                self.send_response(200)
+                self.send_header("Content-Length",str(n))
+                self.end_headers()
+                self.wfile.write(v)
+            else:
+                print("missing",k)
+                self.send_error(404)
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
