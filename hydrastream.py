@@ -3,6 +3,7 @@
 #   curl http://127.0.0.1:8766 | python mp4streamtest.py  -
 #LIVE
 #   ffplay http://127.0.0.1:8766
+#   ffplay  -framerate 10 -probesize 32  http://127.0.0.1:8766/mjpeg -avioflags direct -fflags nobuffer 
 #Web
 #   http://download.tsi.telecom-paristech.fr/gpac/mp4box.js/
 
@@ -471,6 +472,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests in a separate thread."""
+    pass
 if __name__ == '__main__':
     import argparse
 
