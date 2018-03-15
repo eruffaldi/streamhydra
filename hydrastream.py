@@ -35,7 +35,10 @@ ATOM_HEADER = {
 
 def pickffmpegsource(what):
     if what == "screen":
-        command = 'ffmpeg -f avfoundation -i "capture Screen 0"'
+        if sys.platform.find("win") != -1:
+            command  ='ffmpeg -f gdigrab -framerate 30 -i desktop '
+        else:   
+            command = 'ffmpeg -f avfoundation -i "capture Screen 0"'
     elif what == "webcam":
         command = 'ffmpeg -r 30 -s 640x480 -f avfoundation -i "FaceTime HD Camera" ' 
     else:
@@ -453,8 +456,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 #print "HANDLER write",len(a)
                 if len(a) != 0:
                     try:
-                        st = 0
-                        tt = 0
+                        st = 0 # ms since epoch
+                        tt = 0 # 
                         #Note that the encapsulation boundary must occur at the beginning of a line, i.e., following a CRLF, and that that initial CRLF is considered to be part of the encapsulation boundary rather than part of the preceding part. 
                         self.wfile.write(b"\r\n--BOUNDARY\r\nContent-Type: image/jpeg\r\nX-StartTime: %d\r\nX-TimeStamp: %d\r\nContent-Length: %d\r\n\r\n" % (st,tt,len(a)))
                         self.wfile.write(a)
