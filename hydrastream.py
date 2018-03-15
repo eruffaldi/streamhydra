@@ -19,6 +19,10 @@ from threading import Thread
 from socketserver import ThreadingMixIn
 import socket
 
+#with mss.mss() as sct:
+#image = sct.grab(sct.monitors[0])
+#img = Image.frombytes('RGB', sct_img.size, sct_img.rgb)
+
 ATOM_HEADER = {
     # Mandatory big-endian unsigned long followed by 4 character string
     #                      (   size    )             (      type      )
@@ -449,8 +453,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 #print "HANDLER write",len(a)
                 if len(a) != 0:
                     try:
+                        st = 0
+                        tt = 0
                         #Note that the encapsulation boundary must occur at the beginning of a line, i.e., following a CRLF, and that that initial CRLF is considered to be part of the encapsulation boundary rather than part of the preceding part. 
-                        self.wfile.write(b"\r\n--BOUNDARY\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(a))
+                        self.wfile.write(b"\r\n--BOUNDARY\r\nContent-Type: image/jpeg\r\nX-StartTime: %d\r\nX-TimeStamp: %d\r\nContent-Length: %d\r\n\r\n" % (st,tt,len(a)))
                         self.wfile.write(a)
                     except Exception as e:
                         print("HANDLER /mjpeg network exception",self.id,e)
