@@ -7,6 +7,41 @@ import errno
 from tornado.ioloop import IOLoop
 from tornado.platform.auto import set_close_exec
 
+class UDPClient(object):
+
+    def __init__(self, host, port, loop=None):
+        self._loop = asyncio.get_event_loop() if loop is None else loop
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+        self._addr = (host, port)
+        self._future = None
+        self._data = None
+
+    def sendto(self, data):
+        self._future = asyncio.Future(loop=self._loop)
+        self.data = data if isinstance(data, bytes) else str(data).encode('utf-8')
+        loop.add_writer(self._sock.fileno(), self._try_to_send)
+        return self._future
+
+    def _try_to_send(self):
+        try:
+            self._sock.sendto(self.data, self._addr)
+        except (BlockingIOError, InterruptedError):
+            return
+        except Exception as exc:
+            self.abort(exc)
+        else:
+            self.close()
+            self._future.set_result(True)
+
+    def abort(self, exc):
+        self.close()
+        self._future.set_exception(exc)
+
+    def close(self):
+        self._loop.remove_writer(self._sock.fileno())
+        self._sock.close()
+
 class UDPServer(object):
     def __init__(self, io_loop=None):
         self.io_loop = io_loop
@@ -73,14 +108,14 @@ def bind_sockets(port, address=None, family=socket.AF_UNSPEC, backlog=25):
     return sockets
 
 if hasattr(socket, 'AF_UNIX'):
-    def bind_unix_socket(file, mode=0600, backlog=128):
+    def bind_unix_socket(file, mode=0x180, backlog=128):#0600 octal
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         set_close_exec(sock.fileno())
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setblocking(0)
         try:
             st = os.stat(file)
-        except OSError, err:
+        except OSError as err:
             if err.errno != errno.ENOENT:
                 raise
         else:
@@ -102,7 +137,7 @@ def add_accept_handler(sock, callback, io_loop=None):
         while True:
             try:
                 data, address = sock.recvfrom(16384)
-            except socket.error, e:
+            except socket.error as e:
                 if e.args[0] in (errno.EWOULDBLOCK, errno.EAGAIN):
                     return
                 raise
@@ -113,5 +148,5 @@ if __name__ == '__main__':
     serv = UDPServer()
     serv.bind(0,family=socket.AF_INET)
     serv.start()
-    print serv.ports()
+    print (serv.ports())
     IOLoop.instance().start()
