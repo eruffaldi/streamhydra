@@ -70,9 +70,23 @@ class RTPSSession:
     def __init__(self):
         self.udppublisher = None
         self.lastcseq = 0
+        self.ssrc = None
         self.session = 0
         self.path = None
         self.target = None
+
+class RTCPServer(TCPServer):
+    def __init__(self,rtspserver):
+        TCPServer.__init__(self)
+        self.rtspserver = rtspserver
+    @gen.coroutine
+    def handle_stream(self, stream, address):
+        while True:
+            try:
+                print ("RTCP connected by address",address)
+            except:
+                pass
+
 class RTSPServer(TCPServer):
 
     def __init__(self,hub,udppublishers,ports):
@@ -82,6 +96,7 @@ class RTSPServer(TCPServer):
         self.udppublishers = udppublishers    
         self.sessions = {}
         self.lastsession = 1
+        self.ports = ports
     @gen.coroutine
     def handle_stream(self, stream, address):
         print("handle request")
@@ -100,7 +115,7 @@ class RTSPServer(TCPServer):
                 urlparts = urlparse(url)
                 proto = firstparts[2]
                 headers = dict([x.split(b":",1) for x in lines[1:]])
-                cseq = headers.get(b"CSeq",b"0")
+                cseq = headers.get(b"CSeq",b"0").strip(b" ")
                 try:
                     session = int(headers.get(b"Session",b"-1"))
                 except:
@@ -120,7 +135,7 @@ class RTSPServer(TCPServer):
                 except:
                     area = 0
 
-                print("RTP Request from",address,method,url,"headers",headers,"cseq",cseq,"session",session,"osssion",osession)
+                print("RTP Request from",address,method,url,"headers",headers,"cseq <",cseq,"> session",session,"osssion",osession)
 
                 if method == b"OPTIONS":
                     self.sendresponse(stream,200,b"OK",cseq,headers={b"Public":b"DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"})
@@ -134,18 +149,22 @@ class RTSPServer(TCPServer):
                         self.sendresponse(stream,500,b"BAD",cseq)
                     else:
                         at = t.split(b";")
-                        ports = [p.split(b"=")[1] for p in at if p.startswith(b"client_port=")][0]
-                        host = address
-                        port = int(ports.split(b"-")[0])
+                        ports = [p.split(b"=")[1] for p in at if p.startswith(b"client_port=")]
+                        if len(ports) == 0:
+                            host = address
+                            port = int(ports.split(b"-")[0])
 
-                        s = RTPSSession()
-                        s.salt = b"CAFEBABE"                        
-                        s.udppublisher = UDPRTPPublisher(self.hub,b"area%d" % area,self.udppublishers,host,port)
-                        transport = b"RTP/AVP;unicast;client_port=%s;server_port=%s;ssrc=%s" % (ports,self.ports.encode("ascii"),s.salt)
-                        session = self.lastsession 
-                        self.sessions[session] = s
-                        self.lastsession  += 1
-                        self.sendresponse(stream,200,b"OK",cseq,session,headers={b"Transport": transport})
+                            s = RTPSSession()
+                            session = self.lastsession 
+                            s.ssrc = b"%d" % session
+                            s.udppublisher = UDPRTPPublisher(self.hub,b"area%d" % area,self.udppublishers,host,port)
+                            transport = b"RTP/AVP;unicast;client_port=%s;server_port=%s;ssrc=%s" % (ports,self.ports.encode("ascii"),s.ssrc)
+                            self.sessions[session] = s
+                            self.lastsession  += 1
+                            self.sendresponse(stream,200,b"OK",cseq,session,headers={b"Transport": transport})
+                        else:
+                            self.sendresponse(stream,500,b"BAD",cseq,session)
+                            pass
                     # block interleaved=0-1
                     # Transport: RTP/AVP;unicast;client_port=8000-8001;server_port=9000-9001;ssrc=1234ABCD
                 elif method == b"PLAY":
@@ -198,7 +217,7 @@ class RTSPServer(TCPServer):
     @gen.coroutine
     def sendresponse(self,stream,code,text,cseq,session=None,headers=None):
         self.writeresponse(stream,code,text)
-        h = {b"CSeq": strbyte(cseq)}
+        h = {b"CSeq": cseq}
         if session is not None:
             h[b"Session"] = strbyte(session)
         if headers is not None:
@@ -208,7 +227,7 @@ class RTSPServer(TCPServer):
     @gen.coroutine
     def sendcontent(self,stream,content,contenttype,cseq,session=None,headers=None):
         self.writeresponse(stream,200,b"OK")
-        h = {b"CSeq": strbyte(cseq)}
+        h = {b"CSeq": cseq}
         if session is not None:
             h[b"Session"] = strbyte(session)
         h[b"Content-Length"] = strbyte(len(content))
@@ -306,8 +325,10 @@ class UDPRTPPublisher:
     def __init__(self,hub,sourcename,udppublishers,host,port,paused=False):
         self.hub = hub
         self.paused = paused
+        self.rtcp = False
         self.udppublishers = udppublishers
         self.target =  (host,port)
+        self.started = time.time()
         w = udppublishers.get(self.target)
         if w is not None:
             print("UDP stopping existing UDP target",self.target)
@@ -321,7 +342,10 @@ class UDPRTPPublisher:
     @gen.coroutine
     def ondata(self,key,x):
         if not self.paused:
-            yield self.udp.sendto(x[1])
+            if not self.rtcp and (time.time()-self.started) > 1800:
+                self.stop()
+            else:
+                yield self.udp.sendto(x[1])
 
     def stop(self):
         print ("stopping publisher",self.target,self.udp,self)
@@ -647,6 +671,8 @@ def main():
     if args.rtsp != 0:
         rserver = RTSPServer(hub,udppublishers,"%d-%d" % (args.rtsp,args.rtsp+1))
         rserver.listen(args.rtsp)
+        cserver = RTCPServer(rserver)
+        cserver.listen(args.rtsp+1)
     signal.signal(signal.SIGINT, lambda x, y: IOLoop.instance().stop())
     IOLoop.instance().spawn_callback(lambda: startffmpeg(syntax))
     print ("loop starting")
