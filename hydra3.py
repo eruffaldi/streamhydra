@@ -63,6 +63,129 @@ class StreamingJpeg:
                 data = data[k+2:]
         self.data = data
 
+class RTPSSession:
+    def __init__(self):
+        self.udppublisher = None
+        self.lastcseq = 0
+        self.session = 0
+        self.path = None
+        self.target = None
+class RTSPServer(TCPServer):
+
+    def __init__(self,hub,udppublishers):
+        TCPServer.__init__(self)
+        self.hub = hub
+        self.udppublishers = udppublishers    
+        self.sessions = {}
+        self.lastsession = 1
+    @gen.coroutine
+    def handle_stream(self, stream, address):
+        while True:
+            try:
+                #UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
+                data = yield stream.read_until("\r\n\r\n",max_bytes=1024)
+                lines = data.strip().split("\r\n")
+                first = lines[0]
+                firstparts = first.split(" ")
+                method = firstparts[0]
+                url = firstparts[1]
+                urlparts = urlparse.urlparse(url)
+                proto = firstparts[2]
+                headers = dict([x.split(":",1) for x in lines[1:]])
+                cseq = headers.get("CSeq","0")
+                session = headers.get("Session",None)
+                osession = self.sessions.get(session)
+
+                #https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol
+                if proto != "RTSP/1.0" or urlparts.scheme != "rtsp":
+                    return
+                if not urlparts.path.startswith("/area"):
+                    return
+                area = int(urlparts.path[5:])
+
+                if method == "OPTIONS":
+                    self.sendresponse(stream,200,"OK",cseq,headers=dict(Public="DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"))
+                elif method == "DESCRIBE":
+                    self.sendcontent(stream,content,"application/sdp",cseq=cseq)
+                elif method == "SETUP":
+                    # CSeq
+                    # TRANSPORT Transport: RTP/AVP;unicast;client_port=8000-8001
+                    t = headers.get("Transport")
+                    host = "127.0.0.1"
+                    port = 10000
+
+                    s = RTPSSession()
+                    s.udppublisher = UDPRTPPublisher(self.hub,"area%d" % area,self.udppublishers,host,port)
+                    transport = ""
+                    session = self.lastsession 
+                    self.sessions[session] = s
+                    self.lastsession  += 1
+                    self.sendresponse(stream,200,"OK",cseq,session,headers={"Transport": transport})
+                    # block interleaved=0-1
+                    # Transport: RTP/AVP;unicast;client_port=8000-8001;server_port=9000-9001;ssrc=1234ABCD
+                elif method == "PLAY":
+                    if osession is not None:
+                        osession.udppublisher.paused = False
+                        # TODO: respond RTP-Info: url=rtsp://example.com/media.mp4/streamid=0;seq=9810092;rtptime=3450012
+                        rtpinfo = "url=%s;seq=%d;rtptime=%d" % (url,0,0)
+                        self.sendresponse(stream,200,"OK",cseq,session,headers={"RTP-Info":rtpinfo})
+                    else:
+                        self.sendresponse(stream,404,"Unknown",cseq)
+                elif method == "PAUSE":
+                    if osession is not None:
+                        osession.udppublisher.paused = True
+                        self.sendresponse(stream,200,"OK",cseq,session)
+                    else:
+                        self.sendresponse(stream,404,"Unknown",cseq)
+                elif method == "TEARDOWN":
+                    if osession is not None:
+                        osession.udppublisher.stop()
+                        del self.sessions[session]
+                        self.sendresponse(stream,200,"OK",cseq,session)
+                    else:
+                        self.sendresponse(stream,404,"Unknown",cseq)
+                else:
+                    self.sendresponse(stream,404,"Unknown " + method,cseq)
+                #ANNOUNCE
+                #GET_PARAMETER e.g. packets_received jitter as text/parameters
+                #SET_PARAMETER
+                #REDIRECT
+                #RECORD
+
+    @gen.coroutine
+    def writeresponse(self,stream,code,text):
+        yield stream.write("RTSP/1.0 %d %s\r\n" % (code,text))
+    @gen.coroutine
+    def writeheaders(self,headers,close=True):
+        h = "".join(["%s:%s\r\n" % (k,v) for k,v in headers.items()])
+        if close:
+            h += "\r\n\r\n"
+        yield stream.write(h)
+    @gen.coroutine
+    def closehead(self,stream):
+        yield stream.write("\r\n\r\n")
+    @gen.coroutine
+    def sendresponse(self,stream,code,text,cseq,session,headers=None):
+        self.writeresponse(stream,code,text)
+        h = {"CSeq": str(cseq)}
+        if session is not None:
+            h["Session"] = session
+        self.writeheaders(h)
+
+    @gen.coroutine
+    def sendcontent(self,stream,content,contenttype,cseq,session=None,headers=None):
+        self.writeresponse(stream,200,"OK")
+        h = {"CSeq": str(cseq)}
+        if session is not None:
+            h["Session"] = session
+        h["Content-Length"] = str(len(content))
+        if contenttype is not None:
+            h["Content-Type"]  = contenttype
+        if headers is not None:
+            h.update(headers)
+        self.writeheaders(h)
+        yield stream.write(content)
+
 class JpegStreamServer(TCPServer):
     def __init__(self,target):
         TCPServer.__init__(self)
@@ -147,8 +270,9 @@ def startffmpeg(args):
     return  process
 
 class UDPRTPPublisher:
-    def __init__(self,hub,sourcename,udppublishers,host,port):
+    def __init__(self,hub,sourcename,udppublishers,host,port,paused=False):
         self.hub = hub
+        self.paused = paused
         self.udppublishers = udppublishers
         self.target =  (host,port)
         w = udppublishers.get(self.target)
@@ -163,7 +287,8 @@ class UDPRTPPublisher:
 
     @gen.coroutine
     def ondata(self,key,x):
-        yield self.udp.sendto(x[1])
+        if not self.paused:
+            yield self.udp.sendto(x[1])
 
     def stop(self):
         print ("stopping publisher",self.target,self.udp,self)
