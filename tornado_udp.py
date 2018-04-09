@@ -6,7 +6,7 @@ import os
 import errno
 from tornado.ioloop import IOLoop
 from tornado.platform.auto import set_close_exec
-
+import asyncio
 class UDPClient(object):
 
     def __init__(self, host, port, loop=None):
@@ -14,29 +14,27 @@ class UDPClient(object):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setblocking(False)
         self._addr = (host, port)
-        self._future = None
         self._data = None
 
     def sendto(self, data):
-        self._future = asyncio.Future(loop=self._loop)
-        self.data = data if isinstance(data, bytes) else str(data).encode('utf-8')
-        loop.add_writer(self._sock.fileno(), self._try_to_send)
-        return self._future
+        f = asyncio.Future(loop=self._loop)
+        data = data if isinstance(data, bytes) else str(data).encode('utf-8')
+        self._loop.add_writer(self._sock.fileno(), lambda: self._try_to_send(f,data) )
+        return f
 
-    def _try_to_send(self):
+    def dsendto(self,data):
+        self._sock.sendto(data, self._addr)
+
+    def _try_to_send(self,f,d):
         try:
-            self._sock.sendto(self.data, self._addr)
+            self._sock.sendto(d, self._addr)
         except (BlockingIOError, InterruptedError):
             return
         except Exception as exc:
-            self.abort(exc)
+            f.set_exception(exc)
         else:
-            self.close()
-            self._future.set_result(True)
-
-    def abort(self, exc):
-        self.close()
-        self._future.set_exception(exc)
+            if not f.done():
+                f.set_result(True)
 
     def close(self):
         self._loop.remove_writer(self._sock.fileno())

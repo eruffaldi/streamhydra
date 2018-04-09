@@ -21,6 +21,7 @@ from tornado.iostream import StreamClosedError
 from tornado import gen
 import aiopubsub
 import threading
+import asyncio
 import queue
 import os
 
@@ -92,7 +93,7 @@ class RTPStreamServer(UDPServer):
         self.target = target
     @gen.coroutine
     def _on_receive(self, data, address):
-        print ("received rtp packet",(len(data),address))
+        #print ("received rtp packet",(len(data),address))
         yield self.target(data)
 
 
@@ -121,7 +122,7 @@ class Holder:
 
     @gen.coroutine
     def onrtp(self,pkt):
-        print("onrtp",len(pkt))
+        #print("onrtp",len(pkt))
         now = time.time()
         yield self.rtppub.publish(aiopubsub.Key(),(now,pkt))
 
@@ -144,30 +145,84 @@ def startffmpeg(args):
         else:
             raise
     return  process
+
+class UDPRTPPublisher:
+    def __init__(self,hub,sourcename,udppublishers,host,port):
+        self.hub = hub
+        self.udppublishers = udppublishers
+        self.target =  (host,port)
+        w = udppublishers.get(self.target)
+        if w is not None:
+            print("UDP stopping existing UDP target",self.target)
+            w.stop()
+        udppublishers[self.target] = self
+        self.udp = UDPClient(host,port)
+        self.key = sourcename
+        self.subscriber = aiopubsub.Subscriber(hub,self.key)
+        self.subscriber.add_listener(self.key, self.ondata)
+
+    @gen.coroutine
+    def ondata(self,key,x):
+        yield self.udp.sendto(x[1])
+
+    def stop(self):
+        print ("stopping publisher",self.target,self.udp,self)
+        del self.udppublishers[self.target] # remove for future 
+        self.subscriber.unsubscribe(self.key)
+
+def makesdp(name,host,port):
+    lines = open(name,"rt").read().split("\n")
+    for i,l in enumerate(lines):
+        if l.startswith("m=video"):
+            #m=video 52645 RTP/AVP 96
+            a = l.split(" ")
+            a[1] = port
+            lines[i] = " ".join(a)
+        elif l.startswith("c="):
+            a = l.split(" ")
+            a[2] = host
+            lines[i] = " ".join(a)   
+    return "\n".join(lines) 
 class RTPHandler(tornado.web.RequestHandler):
-    def get(self,host,port,**kwargs):
-        self.write("RTP entrypoint opener to %s:%d" % (host,port))
-        qc = UDPRTPPublisher(kwargs["hub"],kwargs["name"],kwargs["udppublishers"],host,port)
+    def initialize(self,**kwargs):
+        self.kwargs = kwargs
+    def get(self,host,port):
+        port = int(port)
+        self.write("RTP entrypoint opener to %s:%d<br><a href='/sdp/%s/%d'>sdp</a>" % (host,port,host,port))
+        qc = UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
+
+#https://tools.ietf.org/html/rfc4566
+class SDPHandlerCustom(tornado.web.RequestHandler):
+    def initialize(self,filename):
+        self.filename = filename
+    def get(self,host,port):
+        self.write(makesdp(self.filename,host,port))
+
+
 
 class StopRTPHandler(tornado.web.RequestHandler):
-    def get(self,host,port,**kwargs):
+    def get(self,host,port):
         q = (host,port)
         w = kwargs["udppublishers"].get(q)
         if w is not None:
             w.stop()
-            self.write("stopping")
+            self.write("stopping publisher %s:%d" % q)
         else:
             self.clear()
             self.set_status(404) 
             self.finish("missing")
 
 class SDPHandler(tornado.web.RequestHandler):
-    def get(self,**kwargs):
-        self.write(open(kwargs["filename"],"rb").read())
+    def initialize(self,filename):
+        self.filename = filename
+    def get(self):
+        self.write(open(self.filename,"rb").read())
 
 class ListRTPsHandler(tornado.web.RequestHandler):
-    def get(self,**kwargs):
-        for k,v in kwargs["udppublishers"].items():
+    def initialize(self,udppublishers):
+        self.udppublishers = udppublishers
+    def get(self):
+        for k,v in self.udppublishers.items():
             self.write("<br/>%s <a href='/stop/%s/%d'>Stop</a></br/>" % (k,k[0],k[1]))
 
 
@@ -376,6 +431,7 @@ def main():
             listeners[i]["sdp"] = sdpfilename
             # start and describe rtp like in RTSP
             handlers.append((r"/rtp%d/([^/]+)/(\d+)" % i, RTPHandler, dict(hub=hub,name=("area%d"%i,"rtp"),udppublishers=udppublishers)))
+            handlers.append((r"/sdp%d/([^/]+)/(\d+)" % i, SDPHandlerCustom, dict(filename=sdpfilename)))
             handlers.append((r"/sdp%d" % i, SDPHandler, dict(filename=sdpfilename)))
             holder.rtppub = rtppub
 
@@ -426,3 +482,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+#ffplay <(curl http://127.0.0.1:8080/sdp0/127.0.0.1/1234)
+#ffplay -protocol_whitelist rtp,file,udp <(curl http://127.0.0.1:8080/sdp0/127.0.0.1/1234)
