@@ -1,11 +1,8 @@
 
 
 import argparse
-import mss
 import subprocess
-from ffmpy import FFmpeg
 import time
-from PIL import Image
 import asyncio
 import signal
 import socket
@@ -46,7 +43,7 @@ class StreamingJpeg:
     def __init__(self):
         self.data = b"" # buffer
         self.buffer = b"" # for whole
-    @gen.coroutine
+    # generator NOT a coroutine
     def ondata(self):
         data = self.data
         while len(data) != 0:
@@ -78,10 +75,12 @@ class JpegStreamServer(TCPServer):
         while True:
             try:
                 # TODO read available
-                data = yield stream.read(16384)
+                data = yield stream.read_bytes(16384,partial=True)
                 print("read %d" % len(data))
                 # parse the avaialble and eat until new jpeg 
-                for y in q.ondata(data):
+                q.data = q.data + data
+                for y in q.ondata():
+                    print("split %d"% len(y))
                     yield self.target(y)
                 # the StreamingJpeg is the endpoint: link StreamingJpeg publisher to this publisher
             except StreamClosedError:
@@ -116,36 +115,35 @@ class Holder:
 
     @gen.coroutine
     def onjpeg(self,img):
+        print("onjpeg",len(img))
         now = time.time()
-        self.jpegpub.publish(aiopubsub.Key(),(now,img))
+        yield self.jpegpub.publish(aiopubsub.Key(),(now,img))
 
     @gen.coroutine
     def onrtp(self,pkt):
+        print("onrtp",len(pkt))
         now = time.time()
-        self.rtppub.publish(aiopubsub.Key(),(now,pkt))
+        yield self.rtppub.publish(aiopubsub.Key(),(now,pkt))
 
 def startffmpeg(args):
-   def start(self):
-        if not self.args:
-            return
-        print ("starting ffmpeg"," ".join(self.args))
-        try:
-            FNULL = open(os.devnull, 'w')
-            self.process = subprocess.Popen(
-                self.args,
-                stdin=FNULL,
-                stdout=FNULL,#sys.stdout,#None,
-                stderr=sys.stderr#subprocess.PIPE
-            )
-            #self.process.stderr.close()
-            print ("started",self.args)
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                raise Exception("Executable '{0}' not found".format("ffmpeg"))
-            else:
-                raise
-
-
+    print ("starting:"," ".join(args))
+    try:
+        FNULL = open(os.devnull, 'w')
+        process = subprocess.Popen(
+            args,
+            shell=False,
+            stdin=FNULL,
+            stdout=sys.stdout,#None,
+            stderr=FNULL#sys.stderr  #subprocess.PIPE
+        )
+        print ("spawned")
+        #self.process.stderr.close()
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            raise Exception("Executable '{0}' not found".format("ffmpeg"))
+        else:
+            raise
+    return  process
 class RTPHandler(tornado.web.RequestHandler):
     def get(self,host,port,**kwargs):
         self.write("RTP entrypoint opener to %s:%d" % (host,port))
@@ -194,6 +192,25 @@ class JpegHandler(tornado.web.RequestHandler):
         self.set_header('Connection', 'keep-alive')
         self.set_header("Last-Modified", DT.datetime.utcfromtimestamp(ta).isoformat())
 
+@tornado.web.stream_request_body
+class MJpegInHandler(tornado.web.RequestHandler):
+    def initialize(self,target,hub,name):
+        self.hub = hub
+        self.target = target
+        self.name = name
+        self.stop = False
+        self.q = StreamingJpeg()
+    def post(self):
+        pass
+    @gen.coroutine
+    def data_received(self, chunk):
+        print ("chunk",len(chunk))
+        self.q.data += chunk
+        for y in self.q.ondata():
+            yield self.target(y)
+
+
+
 class MJpegHandler(tornado.web.RequestHandler):
     def initialize(self,hub,name):
         self.hub = hub
@@ -237,20 +254,26 @@ def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate)
     nocrop = False
     args = ["ffmpeg"]
     if inputrate != 0:
-        if inputrate < 0:
-            args.append("-r")
-            args.append(inputrate)
+        args.append("-r")
+        args.append(inputrate)
     if input == "screen":
-        if sys.platform.find("win") != -1:
+        if sys.platform.startswith("win"):
             if False and len(parts) == 1: # optimize
                 pa = "-offset_x %d -offset_y %d -video_size %dx%d" % (parts[0],parts[1],parts[2],parts[3])
                 nocrop = True
             else:
                 pa = ''
-            command  ='-f gdigrab %s -i desktop ' % pa
+            command  = ['-f','gdigrab'] + [pa] + ['-i','desktop']
         else:   
-            command = '-f avfoundation -i "capture Screen 0"'
-        args.append(command)
+            command = ['-f','avfoundation']
+            if inputrate == 0:
+                command.append('-r');
+                command.append('30');
+            command.append('-pix_fmt');
+            command.append('nv12');
+            command.append('-i');
+            command.append('1');
+        args.extend(command)
     else:
         args.append(input)
 
@@ -259,37 +282,49 @@ def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate)
             pass
 
     else:
+        targets = (1 if rtp else 0) + (1 if jpeg else 0)
         # complx
         #-filter_complex '[0:v]split=3[in1][in2][in3];[in1]crop=100:100:150:200[out1];[in2]crop=200:200:200:200[out2];[in3]crop=100:100:300:300[out3];[out1]split=2[out1A][out1B]'
-        splitpart = "[0:v]split%d" % len(parts) + "".join(["[in%d]" % (i+1) for i in range(0,len(parts))])
+        splitpart = "[0:v]split=%d" % len(parts) + "".join(["[in%d]" % i for i in range(0,len(parts))])
         fparts = [splitpart]
         for i,p in enumerate(parts):
-            fparts.append("[in%d]crop=%d:%d:%d:%d[out%d]" % (i,p[2],p[3],p[0],p[1],i))
-            fparts.append("[out%d]split=2[out%dA][out%dB]" % (i,i,i))
+            # crop directly to output
+            if targets == 1:
+                q = "A" if rtp else "B"
+            else:
+                q = ""
+            fparts.append("[in%d]crop=%d:%d:%d:%d[out%d%s]" % (i,p[2],p[3],p[0],p[1],i,q))
+            if targets == 2:
+                fparts.append("[out%d]split=2[out%dA][out%dB]" % (i,i,i))
         args.append('-filter_complex')
-        args.append("'%s'" % ";".join(fparts))
-        for i,p in enumerate(fparts):
+        args.append(";".join(fparts))
+        for i,p in enumerate(parts):
             if rtp:
                 args.append("-map")
-                args.append("[out%dA]")
+                args.append("[out%dA]" %i)
                 args.append("-f")
-                args.append("-rtp")
+                args.append("rtp")
                 args.append("-sdp_file")
                 args.append(listeners[i]["sdp"])
                 if rtpopts != "":
                     args.append(rtpopts)
-                args.append("rtp://127.0.0.1:%d") % listeners[i]["rtp"]
+                args.append("rtp://127.0.0.1:%d" % listeners[i]["rtp"])
             if jpeg:
                 args.append("-map")
-                args.append("[out%dB]")
+                args.append("[out%dB]"% i)
                 args.append("-f")
-                args.append("-mjpeg")
+                args.append("mjpeg")
                 if jpegopts != "":
                     args.append(jpegopts)
-                args.append("tcp://127.0.0.1:%d") % listeners[i]["jpeg"]
+                if listeners[i]["jpeg"][0] == "tcp":
+                    args.append("tcp://127.0.0.1:%d" % listeners[i]["jpeg"][1])
+                else:
+                    args.extend(['-chunked_post','1','-method','POST'])
+                    args.append("http://127.0.0.1" +  listeners[i]["jpeg"][1])
     return args
 
 def main():
+    #ffplay area0.sdp -protocol_whitelist file,udp,rtp
     
     parser = argparse.ArgumentParser(description='Hydra capture')
     parser.add_argument('--area',type=area,nargs="+",help="space sparated regions (default is 0,0,800,600): --area x1,y1,w1,h1 x2,y2,w2,h2 ",default=[(0,0,800,600)])
@@ -303,7 +338,8 @@ def main():
     parser.add_argument('--rtpopts',help="extra rtp options for ffmpeg (e.g. encoder)",default="")
     parser.add_argument('--inputrate',help="grabbing rate (Hz) as -r to be put for the input (default 0)",default=0,type=int)
     parser.add_argument('--input',help="input value. Use 'screen' for desktop otherwise the ffmpeg input comprising the -i (default screen)",default="screen")
-
+    parser.add_argument('--preferhttp',type=str2bool, nargs='?',
+                            const=True, default=True,help="prefer http for internal connection with ffmpeg")
     args = parser.parse_args()
 
     if not args.jpeg and not args.rtp:
@@ -323,13 +359,13 @@ def main():
     ]
     ffmpegs = []
 
-    listeners = []
+    listeners = {}
     for i in range(0,len(parts)):
         name ="area%d" %i
         sdpfilename = "area%d.sdp"%i        
 
         # UDP and TCP listeners
-        listeners.append({})
+        listeners[i]={}
         holder = Holder()
         if args.rtp:
             rtppub = aiopubsub.Publisher(hub, prefix = aiopubsub.Key(name,'rtp'))
@@ -345,10 +381,18 @@ def main():
 
         if args.jpeg:
             jpegpub = aiopubsub.Publisher(hub, prefix = aiopubsub.Key(name,'jpeg'))
-            jserver = JpegStreamServer(holder.onjpeg)
-            jserver.listen(0)
-            listeners[i]["jpeg"] = jserver.ports()[0]
+            if not args.preferhttp or args.http == 0:
+                jserver = JpegStreamServer(holder.onjpeg)
+                jserver.listen(0)
+                listeners[i]["jpeg"] = ("tcp",jserver.ports()[0])
+            else:
+                listeners[i]["jpeg"] = ("http",":%d/jpegin%d" % (args.http,i))
+                handlers.append(("/jpegin%d" % i, MJpegInHandler, dict(target=holder.onjpeg,hub=hub,name=("area%d"%i,"jpeg"))))
+
             holder.jpegpub = jpegpub
+
+            # this could be used with:
+            #  -chunked_post 1 -method POST -f rtp http://127.0.0.1:8080/x
 
             # publis image
             handlers.append(("/jpeg%d" % i, JpegHandler, dict(hub=hub,name=("area%d"%i,"jpeg"))))
@@ -358,7 +402,8 @@ def main():
     print (listeners)
     syntax = makeffmpeg_screen(args.input,parts,listeners,args.rtp,args.jpeg,args.rtpopts,args.jpegopts,args.inputrate)
 
-    print (sytnax)
+    print (syntax)
+    print (" ".join(syntax))
 
     # stop and list RTPs (equivalent to RTSP)
     handlers.append((r"/stop/([^/]+)/(\d+)", StopRTPHandler, dict(hub=hub,udppublishers=udppublishers)))
