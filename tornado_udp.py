@@ -42,7 +42,7 @@ class UDPClient(object):
         self._loop.remove_writer(self._sock.fileno())
         self._sock.close()
 
-class UDPServer(object):
+class UDPServer:
     def __init__(self, io_loop=None):
         self.io_loop = io_loop
         self._sockets = {}  # fd -> socket object
@@ -83,7 +83,7 @@ class UDPServer(object):
             sock.close()
 
     def _on_receive(self, data, address):
-        pass
+        print ("UDPServer RECEIVE",address)
 
 def bind_sockets(port, address=None, family=socket.AF_UNSPEC, backlog=25):
     sockets = []
