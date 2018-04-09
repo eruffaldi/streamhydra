@@ -24,7 +24,10 @@ import threading
 import asyncio
 import queue
 import os
+from urllib.parse import urlparse
 
+def strbyte(a):
+    return str(a).encode("latin1")
 def area(s):
     try:
         x, y, w, h = map(int, s.split(','))
@@ -72,118 +75,148 @@ class RTPSSession:
         self.target = None
 class RTSPServer(TCPServer):
 
-    def __init__(self,hub,udppublishers):
+    def __init__(self,hub,udppublishers,ports):
         TCPServer.__init__(self)
+        self.ports = ports
         self.hub = hub
         self.udppublishers = udppublishers    
         self.sessions = {}
         self.lastsession = 1
     @gen.coroutine
     def handle_stream(self, stream, address):
+        print("handle request")
         while True:
             try:
                 #UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
-                data = yield stream.read_until("\r\n\r\n",max_bytes=1024)
-                lines = data.strip().split("\r\n")
+                data = yield stream.read_until(b"\r\n\r\n",max_bytes=1024)
+                print ("got data",data)
+                lines = data.strip().split(b"\r\n")
                 first = lines[0]
-                firstparts = first.split(" ")
+                firstparts = first.split(b" ")
+                if len(firstparts) < 3:
+                    break
                 method = firstparts[0]
                 url = firstparts[1]
-                urlparts = urlparse.urlparse(url)
+                urlparts = urlparse(url)
                 proto = firstparts[2]
-                headers = dict([x.split(":",1) for x in lines[1:]])
-                cseq = headers.get("CSeq","0")
-                session = headers.get("Session",None)
+                headers = dict([x.split(b":",1) for x in lines[1:]])
+                cseq = headers.get(b"CSeq",b"0")
+                try:
+                    session = int(headers.get(b"Session",b"-1"))
+                except:
+                    session = -1
                 osession = self.sessions.get(session)
 
                 #https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol
-                if proto != "RTSP/1.0" or urlparts.scheme != "rtsp":
+                if proto != b"RTSP/1.0" or urlparts.scheme != b"rtsp":
+                    print ("BAD proto is ",proto,"and scheme is",urlparts.scheme)
                     return
-                if not urlparts.path.startswith("/area"):
+                if not urlparts.path.startswith(b"/area"):
+                    print ("BAD start url not /area")
+                    self.sendresponse(stream,404,b"NOT FOUND only /area#",cseq)
                     return
-                area = int(urlparts.path[5:])
+                try:
+                    area = int(urlparts.path[5:])
+                except:
+                    area = 0
 
-                if method == "OPTIONS":
-                    self.sendresponse(stream,200,"OK",cseq,headers=dict(Public="DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"))
-                elif method == "DESCRIBE":
-                    self.sendcontent(stream,content,"application/sdp",cseq=cseq)
-                elif method == "SETUP":
+                print("RTP Request from",address,method,url,"headers",headers,"cseq",cseq,"session",session,"osssion",osession)
+
+                if method == b"OPTIONS":
+                    self.sendresponse(stream,200,b"OK",cseq,headers={b"Public":b"DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"})
+                elif method == b"DESCRIBE":
+                    self.sendcontent(stream,makesdp(b"area%d.sdp" % area,None,0),b"application/sdp",cseq=cseq)
+                elif method == b"SETUP":
                     # CSeq
                     # TRANSPORT Transport: RTP/AVP;unicast;client_port=8000-8001
-                    t = headers.get("Transport")
-                    host = "127.0.0.1"
-                    port = 10000
+                    t = headers.get(b"Transport",b"")
+                    if not t.startswith(b"RTP/AVP") and not t.find(b"unicast") >= 0 and not t.find(b"client_port") >= 0:
+                        self.sendresponse(stream,500,b"BAD",cseq)
+                    else:
+                        at = t.split(b";")
+                        ports = [p.split(b"=")[1] for p in at if p.startswith(b"client_port=")][0]
+                        host = address
+                        port = int(ports.split(b"-")[0])
 
-                    s = RTPSSession()
-                    s.udppublisher = UDPRTPPublisher(self.hub,"area%d" % area,self.udppublishers,host,port)
-                    transport = ""
-                    session = self.lastsession 
-                    self.sessions[session] = s
-                    self.lastsession  += 1
-                    self.sendresponse(stream,200,"OK",cseq,session,headers={"Transport": transport})
+                        s = RTPSSession()
+                        s.salt = b"CAFEBABE"                        
+                        s.udppublisher = UDPRTPPublisher(self.hub,b"area%d" % area,self.udppublishers,host,port)
+                        transport = b"RTP/AVP;unicast;client_port=%s;server_port=%s;ssrc=%s" % (ports,self.ports.encode("ascii"),s.salt)
+                        session = self.lastsession 
+                        self.sessions[session] = s
+                        self.lastsession  += 1
+                        self.sendresponse(stream,200,b"OK",cseq,session,headers={b"Transport": transport})
                     # block interleaved=0-1
                     # Transport: RTP/AVP;unicast;client_port=8000-8001;server_port=9000-9001;ssrc=1234ABCD
-                elif method == "PLAY":
+                elif method == b"PLAY":
                     if osession is not None:
                         osession.udppublisher.paused = False
                         # TODO: respond RTP-Info: url=rtsp://example.com/media.mp4/streamid=0;seq=9810092;rtptime=3450012
-                        rtpinfo = "url=%s;seq=%d;rtptime=%d" % (url,0,0)
-                        self.sendresponse(stream,200,"OK",cseq,session,headers={"RTP-Info":rtpinfo})
+                        rtpinfo = b"url=%s;seq=%d;rtptime=%d" % (url,0,0)
+                        self.sendresponse(stream,200,b"OK",cseq,session,headers={b"RTP-Info":rtpinfo})
                     else:
-                        self.sendresponse(stream,404,"Unknown",cseq)
-                elif method == "PAUSE":
+                        self.sendresponse(stream,404,b"Unknown session %d" % session,cseq)
+                elif method == b"SESSIONS":
+                    self.sendcontent(stream,b"\r\n".join([b"%d -> %s:%s" % (x,strbyte(self.sessions[x].udppublisher.target[0]),strbyte(self.sessions[x].udppublisher.target[1])) for x in self.sessions.keys()]),contenttype=b"text/plain",cseq=cseq)                    
+                elif method == b"PAUSE":
                     if osession is not None:
                         osession.udppublisher.paused = True
-                        self.sendresponse(stream,200,"OK",cseq,session)
+                        self.sendresponse(stream,200,b"OK",cseq,session)
                     else:
-                        self.sendresponse(stream,404,"Unknown",cseq)
-                elif method == "TEARDOWN":
+                        self.sendresponse(stream,404,b"Unknown session %d" % session,cseq)
+                elif method == b"TEARDOWN":
                     if osession is not None:
                         osession.udppublisher.stop()
                         del self.sessions[session]
-                        self.sendresponse(stream,200,"OK",cseq,session)
+                        self.sendresponse(stream,200,b"OK",cseq,session)
                     else:
-                        self.sendresponse(stream,404,"Unknown",cseq)
+                        self.sendresponse(stream,404,b"Unknown session %d" % session,cseq)
                 else:
-                    self.sendresponse(stream,404,"Unknown " + method,cseq)
+                    self.sendresponse(stream,404,b"Unknown Method " + method,cseq)
                 #ANNOUNCE
                 #GET_PARAMETER e.g. packets_received jitter as text/parameters
                 #SET_PARAMETER
                 #REDIRECT
                 #RECORD
+            except:
+                raise
 
     @gen.coroutine
     def writeresponse(self,stream,code,text):
-        yield stream.write("RTSP/1.0 %d %s\r\n" % (code,text))
+        print("writingresponse",text,text.__class__)
+        yield stream.write(b"RTSP/1.0 %d %s\r\n" % (code,text))
     @gen.coroutine
-    def writeheaders(self,headers,close=True):
-        h = "".join(["%s:%s\r\n" % (k,v) for k,v in headers.items()])
+    def writeheaders(self,stream,headers,close=True):
+        print ("writingrsponse",headers)
+        h = b"".join([b"%s:%s\r\n" % (k,v) for k,v in headers.items()])
         if close:
-            h += "\r\n\r\n"
+            h += b"\r\n\r\n"
         yield stream.write(h)
     @gen.coroutine
     def closehead(self,stream):
-        yield stream.write("\r\n\r\n")
+        yield stream.write(b"\r\n\r\n")
     @gen.coroutine
-    def sendresponse(self,stream,code,text,cseq,session,headers=None):
+    def sendresponse(self,stream,code,text,cseq,session=None,headers=None):
         self.writeresponse(stream,code,text)
-        h = {"CSeq": str(cseq)}
+        h = {b"CSeq": strbyte(cseq)}
         if session is not None:
-            h["Session"] = session
-        self.writeheaders(h)
+            h[b"Session"] = strbyte(session)
+        if headers is not None:
+            h.update(headers)
+        self.writeheaders(stream,h)
 
     @gen.coroutine
     def sendcontent(self,stream,content,contenttype,cseq,session=None,headers=None):
-        self.writeresponse(stream,200,"OK")
-        h = {"CSeq": str(cseq)}
+        self.writeresponse(stream,200,b"OK")
+        h = {b"CSeq": strbyte(cseq)}
         if session is not None:
-            h["Session"] = session
-        h["Content-Length"] = str(len(content))
+            h[b"Session"] = strbyte(session)
+        h[b"Content-Length"] = strbyte(len(content))
         if contenttype is not None:
-            h["Content-Type"]  = contenttype
+            h[b"Content-Type"]  = contenttype
         if headers is not None:
             h.update(headers)
-        self.writeheaders(h)
+        self.writeheaders(stream,h)
         yield stream.write(content)
 
 class JpegStreamServer(TCPServer):
@@ -296,18 +329,29 @@ class UDPRTPPublisher:
         self.subscriber.unsubscribe(self.key)
 
 def makesdp(name,host,port):
-    lines = open(name,"rt").read().split("\n")
+    lines = open(name,"rb").read().split(b"\n")
+    olines = []
     for i,l in enumerate(lines):
-        if l.startswith("m=video"):
+        if l.startswith(b"SDP:"):
+            continue
+        if l.startswith(b"m=video"):
             #m=video 52645 RTP/AVP 96
-            a = l.split(" ")
-            a[1] = port
-            lines[i] = " ".join(a)
-        elif l.startswith("c="):
-            a = l.split(" ")
-            a[2] = host
-            lines[i] = " ".join(a)   
-    return "\n".join(lines) 
+            a = l.split(b" ")
+            a[1] = strbyte(port)
+            olines.append(b" ".join(a))
+        elif host is None:
+            if l.startswith(b"c=") or l.startswith(b"o="):
+                continue
+            else:
+                olines.append(l)
+        else:
+            if l.startswith(b"c="):
+                a = l.split(b" ")
+                a[2] = host.encode("ascii")
+                olines.append(b" ".join(a))
+            else:
+                olines.append(l)
+    return b"\n".join(olines) 
 class RTPHandler(tornado.web.RequestHandler):
     def initialize(self,**kwargs):
         self.kwargs = kwargs
@@ -600,6 +644,9 @@ def main():
     if args.http != 0:
         print ("listening on port",args.http)
         server.listen(args.http) 
+    if args.rtsp != 0:
+        rserver = RTSPServer(hub,udppublishers,"%d-%d" % (args.rtsp,args.rtsp+1))
+        rserver.listen(args.rtsp)
     signal.signal(signal.SIGINT, lambda x, y: IOLoop.instance().stop())
     IOLoop.instance().spawn_callback(lambda: startffmpeg(syntax))
     print ("loop starting")
@@ -610,3 +657,7 @@ if __name__ == '__main__':
 
 #ffplay <(curl http://127.0.0.1:8080/sdp0/127.0.0.1/1234)
 #ffplay -protocol_whitelist rtp,file,udp <(curl http://127.0.0.1:8080/sdp0/127.0.0.1/1234)
+#https://github.com/Akagi201/curl-rtsp
+
+# Test RTSP
+# OPTIONS rtsp://127.0.0.1:8666/ RTSP/1.0
