@@ -88,7 +88,6 @@ class RTCPServer(TCPServer):
                 pass
 
 class RTSPServer(TCPServer):
-
     def __init__(self,hub,udppublishers,ports):
         TCPServer.__init__(self)
         self.ports = ports
@@ -99,12 +98,11 @@ class RTSPServer(TCPServer):
         self.ports = ports
     @gen.coroutine
     def handle_stream(self, stream, address):
-        print("handle request")
         while True:
             try:
                 #UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
                 data = yield stream.read_until(b"\r\n\r\n",max_bytes=1024)
-                print ("got data",data)
+                print ("RTSP request from",address,data)
                 lines = data.strip().split(b"\r\n")
                 first = lines[0]
                 firstparts = first.split(b" ")
@@ -114,7 +112,7 @@ class RTSPServer(TCPServer):
                 url = firstparts[1]
                 urlparts = urlparse(url)
                 proto = firstparts[2]
-                headers = dict([x.split(b":",1) for x in lines[1:]])
+                headers = dict([[y.strip() for y in x.split(b":",1)] for x in lines[1:]])
                 cseq = headers.get(b"CSeq",b"0").strip(b" ")
                 try:
                     session = int(headers.get(b"Session",b"-1"))
@@ -135,7 +133,7 @@ class RTSPServer(TCPServer):
                 except:
                     area = 0
 
-                print("RTP Request from",address,method,url,"headers",headers,"cseq <",cseq,"> session",session,"osssion",osession)
+                print("RTSP parsed reques from",address,method,url,"headers",headers,"cseq <",cseq,"> session",session,"osssion",osession)
 
                 if method == b"OPTIONS":
                     self.sendresponse(stream,200,b"OK",cseq,headers={b"Public":b"DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"})
@@ -145,8 +143,8 @@ class RTSPServer(TCPServer):
                     # CSeq
                     # TRANSPORT Transport: RTP/AVP;unicast;client_port=8000-8001
                     t = headers.get(b"Transport",b"")
-                    if not t.startswith(b"RTP/AVP") and not t.find(b"unicast") >= 0 and not t.find(b"client_port") >= 0:
-                        self.sendresponse(stream,500,b"BAD",cseq)
+                    if not t.startswith(b"RTP/AVP") or not t.find(b"unicast") >= 0 or not t.find(b"client_port") >= 0:
+                        self.sendresponse(stream,500,b"BAD %s %s %s" % (t.startswith(b"RTP/AVP"),t.find(b"unicast"),t.find(b"client_port")))
                     else:
                         at = t.split(b";")
                         ports = [p.split(b"=")[1] for p in at if p.startswith(b"client_port=")]
@@ -163,7 +161,7 @@ class RTSPServer(TCPServer):
                             self.lastsession  += 1
                             self.sendresponse(stream,200,b"OK",cseq,session,headers={b"Transport": transport})
                         else:
-                            self.sendresponse(stream,500,b"BAD",cseq,session)
+                            self.sendresponse(stream,500,b"NO PORTS...",cseq,session)
                             pass
                     # block interleaved=0-1
                     # Transport: RTP/AVP;unicast;client_port=8000-8001;server_port=9000-9001;ssrc=1234ABCD
@@ -202,14 +200,15 @@ class RTSPServer(TCPServer):
 
     @gen.coroutine
     def writeresponse(self,stream,code,text):
-        print("writingresponse",text,text.__class__)
+        print("RTSP writingresponse:",code,text)
         yield stream.write(b"RTSP/1.0 %d %s\r\n" % (code,text))
     @gen.coroutine
     def writeheaders(self,stream,headers,close=True):
-        print ("writingrsponse",headers)
-        h = b"".join([b"%s:%s\r\n" % (k,v) for k,v in headers.items()])
+        print ("RTSP writeheaders",headers)
+        h = b"".join([b"%s: %s\r\n" % (k,v) for k,v in headers.items()])
         if close:
-            h += b"\r\n\r\n"
+            h += b"\r\n"
+        print ("RTSP header text",h)
         yield stream.write(h)
     @gen.coroutine
     def closehead(self,stream):
@@ -236,6 +235,7 @@ class RTSPServer(TCPServer):
         if headers is not None:
             h.update(headers)
         self.writeheaders(stream,h)
+        print ("RTSP content",content)        
         yield stream.write(content)
 
 class JpegStreamServer(TCPServer):
@@ -246,13 +246,11 @@ class JpegStreamServer(TCPServer):
         return [sock.getsockname()[1] for sock in self._sockets.values()]
     @gen.coroutine
     def handle_stream(self, stream, address):
-        print ("JpegStreamServer handle")
         q = StreamingJpeg()
         while True:
             try:
                 # TODO read available
                 data = yield stream.read_bytes(16384,partial=True)
-                print("read %d" % len(data))
                 # parse the avaialble and eat until new jpeg 
                 q.data = q.data + data
                 for y in q.ondata():
@@ -262,13 +260,12 @@ class JpegStreamServer(TCPServer):
             except StreamClosedError:
                 break
 
-class RTPStreamServer(UDPServer):
+class UDPServerToCoroutine(UDPServer):
     def __init__(self,target):
         UDPServer.__init__(self)
         self.target = target
     @gen.coroutine
     def _on_receive(self, data, address):
-        #print ("received rtp packet",(len(data),address))
         yield self.target(data)
 
 
@@ -617,7 +614,7 @@ def main():
         holder = Holder()
         if args.rtp:
             rtppub = aiopubsub.Publisher(hub, prefix = aiopubsub.Key(name,'rtp'))
-            hserver = RTPStreamServer(holder.onrtp)
+            hserver = UDPServerToCoroutine(holder.onrtp)
             hserver.bind(0,family=socket.AF_INET)
             hserver.start()
             listeners[i]["rtp"] = hserver.ports()[0]
