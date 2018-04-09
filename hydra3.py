@@ -1,4 +1,8 @@
 
+try:
+    from termcolor import colored
+except:
+    colored = lambda x,y: x
 
 import argparse
 import subprocess
@@ -102,7 +106,7 @@ class RTSPServer(TCPServer):
             try:
                 #UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
                 data = yield stream.read_until(b"\r\n\r\n",max_bytes=1024)
-                print ("RTSP request from",address,data)
+                #print ("RTSP request from",address,data)
                 lines = data.strip().split(b"\r\n")
                 first = lines[0]
                 firstparts = first.split(b" ")
@@ -133,7 +137,7 @@ class RTSPServer(TCPServer):
                 except:
                     area = 0
 
-                print("RTSP parsed reques from",address,method,url,"headers",headers,"cseq <",cseq,"> session",session,"osssion",osession)
+                print(colored("RTSP parsed request","red")," from",address,colored(method,"red"),url,"headers",headers,"cseq <",cseq,"> session",session,"osssion",osession)
 
                 if method == b"OPTIONS":
                     self.sendresponse(stream,200,b"OK",cseq,headers={b"Public":b"DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE"})
@@ -143,24 +147,25 @@ class RTSPServer(TCPServer):
                     # CSeq
                     # TRANSPORT Transport: RTP/AVP;unicast;client_port=8000-8001
                     t = headers.get(b"Transport",b"")
-                    if not t.startswith(b"RTP/AVP") or not t.find(b"unicast") >= 0 or not t.find(b"client_port") >= 0:
-                        self.sendresponse(stream,500,b"BAD %s %s %s" % (t.startswith(b"RTP/AVP"),t.find(b"unicast"),t.find(b"client_port")))
+                    if not t.startswith(b"RTP/AVP/UDP") or not t.find(b"unicast") >= 0 or not t.find(b"client_port") >= 0:
+                        self.sendresponse(stream,500,b"BAD request SETUP",cseq=cseq) # %s %s %s" % (t.startswith(b"RTP/AVP"),t.find(b"unicast"),t.find(b"client_port")))
                     else:
                         at = t.split(b";")
                         ports = [p.split(b"=")[1] for p in at if p.startswith(b"client_port=")]
-                        if len(ports) == 0:
+                        if len(ports) > 0:
                             host = address
-                            port = int(ports.split(b"-")[0])
+                            port = int(ports[0].split(b"-")[0])
 
                             s = RTPSSession()
                             session = self.lastsession 
                             s.ssrc = b"%d" % session
-                            s.udppublisher = UDPRTPPublisher(self.hub,b"area%d" % area,self.udppublishers,host,port)
-                            transport = b"RTP/AVP;unicast;client_port=%s;server_port=%s;ssrc=%s" % (ports,self.ports.encode("ascii"),s.ssrc)
+                            s.udppublisher = UDPRTPPublisher(self.hub,b"area%d" % area,self.udppublishers,host,port,paused=True)
+                            transport = b"RTP/AVP;unicast;client_port=%s;server_port=%s;ssrc=%s" % (ports[0],self.ports.encode("ascii"),s.ssrc)
                             self.sessions[session] = s
                             self.lastsession  += 1
                             self.sendresponse(stream,200,b"OK",cseq,session,headers={b"Transport": transport})
                         else:
+                            print("RTSP 500 NO ports in",at)
                             self.sendresponse(stream,500,b"NO PORTS...",cseq,session)
                             pass
                     # block interleaved=0-1
@@ -200,7 +205,7 @@ class RTSPServer(TCPServer):
 
     @gen.coroutine
     def writeresponse(self,stream,code,text):
-        print("RTSP writingresponse:",code,text)
+        print(colored("RTSP response:","green"),code,text)
         yield stream.write(b"RTSP/1.0 %d %s\r\n" % (code,text))
     @gen.coroutine
     def writeheaders(self,stream,headers,close=True):
@@ -333,16 +338,20 @@ class UDPRTPPublisher:
         udppublishers[self.target] = self
         self.udp = UDPClient(host,port)
         self.key = sourcename
+        print(colored("UDPRTPPublisher","green"))
         self.subscriber = aiopubsub.Subscriber(hub,self.key)
         self.subscriber.add_listener(self.key, self.ondata)
+        print(colored("UDPRTPPublisher subscribed","green"))
 
     @gen.coroutine
     def ondata(self,key,x):
         if not self.paused:
-            if not self.rtcp and (time.time()-self.started) > 1800:
-                self.stop()
-            else:
-                yield self.udp.sendto(x[1])
+            #if not self.rtcp and (time.time()-self.started) > 1800:
+            #    self.stop()
+            #else:
+            yield self.udp.sendto(x[1])
+        else:
+            print (".",end="")
 
     def stop(self):
         print ("stopping publisher",self.target,self.udp,self)
