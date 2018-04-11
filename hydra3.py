@@ -1,9 +1,16 @@
+# TODO:
+# back RTSP connection
+# muxing RTP H264  into ISO BMFF (MP4) fragments. e.g. https://github.com/Streamedian/html5_rtsp_player
+import sys
+import os
+sys.path.insert(1, os.path.abspath(os.path.split(sys.argv[0])[0]))
 
 try:
     from termcolor import colored
 except:
     colored = lambda x,y: x
 
+import struct
 import argparse
 import subprocess
 import time
@@ -14,7 +21,7 @@ import tornado.web
 import io
 import sys
 import datetime as DT
-from tornado import web, gen,ioloop
+from tornado import web, gen,ioloop,websocket
 from tornado.options import options
 from tornado.httpserver import HTTPServer
 from tornado.ioloop import IOLoop, PeriodicCallback
@@ -29,6 +36,7 @@ import asyncio
 import queue
 import os
 from urllib.parse import urlparse
+import json 
 
 def strbyte(a):
     return str(a).encode("latin1")
@@ -46,6 +54,70 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+def parseH264header(packet):
+    #http://www.netlab.tkk.fi/opetus/s383152/2010/2-rtp-b.pdf
+    #https://www.itu.int/rec/T-REC-H.264-201704-I/en
+    #Table 7-1 – NAL unit type codes, syntax element categories, and NAL unit type classes
+    b = ord(packet[0])
+    F = b & 0x80
+    NRI = b & 0x60 
+    NALUtype = b & 0x1F
+    if F == 0:
+        return None
+    # packet is padded to be aligned
+    else:
+        return dict(discardableNRI=NRI,nalutype=NALUtype,body=packet[1:])
+def parsePacket(packet):
+    # from https://github.com/sparkslabs/kamaelia
+    e = struct.unpack(">BBHII",packet[:12])
+    
+    if (e[0]>>6) != 2:       # check version is 2
+        return None
+    
+    # ignore padding bit atm
+    
+    hasPadding   = e[0] & 0x20
+    hasExtension = e[0] & 0x10
+    numCSRCs     = e[0] & 0x0f
+    hasMarker    = e[1] & 0x80
+    payloadType  = e[1] & 0x7f
+    seqnum       = e[2]
+    timestamp    = e[3]
+    ssrc         = e[4]
+    
+    i=12
+    if numCSRCs:
+        csrcs = struct.unpack(">"+str(numCSRCs)+"I", packet[i:i+4*csrcs])
+        i=i+4*numCSRCs
+    else:
+        csrcs = []
+        
+    if hasExtension:
+        ehdr, length = struct(">2sH",packet[i:i+4])
+        epayload = packet[i+4:i+4+length]
+        extension = (ehdr,epayload)
+        i=i+4+length
+    else:
+        extension = None
+    
+    # now work out how much padding needs stripping, if at all
+    end = len(packet)
+    if hasPadding:
+        amount = ord(packet[-1])
+        end = end - amount
+        
+    payload = packet[i:end]
+    
+    return ( seqnum,
+             { 'payloadtype' : payloadType,
+               'payload'     : payload,
+               'timestamp'   : timestamp,
+               'ssrc'        : ssrc,
+               'extension'   : extension,
+               'csrcs'       : csrcs,
+               'marker'      : hasMarker,
+             }
+           )
 
 class StreamingJpeg:
     def __init__(self):
@@ -293,7 +365,6 @@ class Holder:
 
     @gen.coroutine
     def onjpeg(self,img):
-        print("onjpeg",len(img))
         now = time.time()
         yield self.jpegpub.publish(aiopubsub.Key(),(now,img))
 
@@ -303,16 +374,22 @@ class Holder:
         now = time.time()
         yield self.rtppub.publish(aiopubsub.Key(),(now,pkt))
 
-def startffmpeg(args):
+def startffmpeg(args,verbose=False):
     print ("starting:"," ".join(args))
     try:
         FNULL = open(os.devnull, 'w')
+        if not verbose and sys.platform.startswith("win"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        else:
+            startupinfo = None
         process = subprocess.Popen(
             args,
             shell=False,
             stdin=FNULL,
-            stdout=sys.stdout,#None,
-            stderr=FNULL#sys.stderr  #subprocess.PIPE
+            stdout=sys.stdout if verbose else FNULL,#None,
+            stderr=sys.stderr if verbose else FNULL,#sys.stderr  #subprocess.PIPE
+            startupinfo=startupinfo
         )
         print ("spawned")
         #self.process.stderr.close()
@@ -352,7 +429,6 @@ class UDPRTPPublisher:
             yield self.udp.sendto(x[1])
         else:
             print (".",end="")
-
     def stop(self):
         print ("stopping publisher",self.target,self.udp,self)
         del self.udppublishers[self.target] # remove for future 
@@ -385,10 +461,91 @@ def makesdp(name,host,port):
 class RTPHandler(tornado.web.RequestHandler):
     def initialize(self,**kwargs):
         self.kwargs = kwargs
-    def get(self,host,port):
-        port = int(port)
-        self.write("RTP entrypoint opener to %s:%d<br><a href='/sdp/%s/%d'>sdp</a>" % (host,port,host,port))
-        qc = UDPRTPPublisher(self.kwargs["hub"],self.kwargs["name"],self.kwargs["udppublishers"],host,port)
+
+class RTPChunkedHandler(tornado.web.RequestHandler):
+    def initialize(self,**kwargs):
+        self.kwargs = kwargs
+        self.stop = False
+    def on_connection_close(self):
+        self.stop = True
+    @gen.coroutine
+    def get(self):
+        subscriber = aiopubsub.Subscriber(self.kwargs["hub"],self.kwargs["name"])
+        subscriber.subscribe(self.kwargs["name"])
+        self.set_status(200) # 200 OK http response
+        self.set_header('Content-type', 'application/rtp')
+        self.set_header("Transfer-Encoding", "chunked")
+        self.set_header('Cache-Control', 'no-cache')
+        self.set_header('Connection', 'keep-alive')
+        while True:
+            # BUG this could be stuck
+            key, ta_message = yield subscriber.consumelast()
+            if self.stop:
+                break
+            now = time.time()
+            ta = ta_message[0]
+            self.writechunk(ta_message[1])
+    @gen.coroutine
+    def writechunk(self,chunk):
+        tosend = b'%X\r\n'%(len(chunk))
+        yield self.write(tosend+chunk+b"\r\n")
+        yield self.flush()
+
+class RTPDumpHandler(tornado.web.RequestHandler):
+    def initialize(self,**kwargs):
+        self.kwargs = kwargs
+        self.stop = False
+    def on_connection_close(self):
+        self.stop = True
+    @gen.coroutine
+    def get(self):
+        subscriber = aiopubsub.Subscriber(self.kwargs["hub"],self.kwargs["name"])
+        subscriber.subscribe(self.kwargs["name"])
+        self.set_status(200) # 200 OK http response
+        self.set_header('Content-type', 'application/json')
+        self.set_header("Transfer-Encoding", "chunked")
+        self.set_header('Cache-Control', 'no-cache')
+        self.set_header('Connection', 'keep-alive')
+        while True:
+            # BUG this could be stuck
+            key, ta_message = yield subscriber.consumelast()
+            if self.stop:
+                break
+            now = time.time()
+            ta = ta_message[0]
+            pa = parsePacket(ta_message[1])
+            if pa is None:
+                pa = ("Invalid",len(ta_message[1]))
+            else:
+                pa[1]["payload"] = len(pa[1]["payload"])
+            self.writechunk(json.dumps(pa).encode("latin1")+b"\r\n")
+    @gen.coroutine
+    def writechunk(self,chunk):
+        tosend = b'%X\r\n'%(len(chunk))
+        yield self.write(tosend+chunk+b"\r\n")
+        yield self.flush()
+class RTPWSHandler(tornado.websocket.WebSocketHandler):
+    def initialize(self,**kwargs):
+        self.kwargs = kwargs
+        self.stop = False
+    def check_origin(self, origin):
+        return True
+    def on_close(self):
+        self.stop = True
+    @gen.coroutine
+    def open(self):
+        subscriber = aiopubsub.Subscriber(self.kwargs["hub"],self.kwargs["name"])
+        subscriber.subscribe(self.kwargs["name"])
+        # TODO: how to send 
+        while True:
+            # BUG this could be stuck
+            key, ta_message = yield subscriber.consumelast()
+            if self.stop:
+                break
+            now = time.time()
+            ta = ta_message[0]
+            self.write_message(ta_message[1])
+        self.close()
 
 #https://tools.ietf.org/html/rfc4566
 class SDPHandlerCustom(tornado.web.RequestHandler):
@@ -416,6 +573,14 @@ class SDPHandler(tornado.web.RequestHandler):
         self.filename = filename
     def get(self):
         self.write(open(self.filename,"rb").read())
+
+
+class QuitHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write("bye bye")
+        self.flush()
+        ioloop = tornado.ioloop.IOLoop.instance()
+        ioloop.add_callback(ioloop.stop)
 
 class ListRTPsHandler(tornado.web.RequestHandler):
     def initialize(self,udppublishers):
@@ -458,7 +623,6 @@ class MJpegInHandler(tornado.web.RequestHandler):
         pass
     @gen.coroutine
     def data_received(self, chunk):
-        print ("chunk",len(chunk))
         self.q.data += chunk
         for y in self.q.ondata():
             yield self.target(y)
@@ -473,7 +637,6 @@ class MJpegHandler(tornado.web.RequestHandler):
     def on_connection_close(self):
         self.stop = True
     def options(self):
-        print ("mjpeg options")
         self.set_status(200)
         self.set_header('Cache-Control', 'no-cache')
         self.set_header('Allow', 'GET')
@@ -482,7 +645,6 @@ class MJpegHandler(tornado.web.RequestHandler):
         self.set_header("Access-Control-Allow-Headers","Content-Type")
     @gen.coroutine
     def get(self):
-        print ("mjpeg options")
         subscriber = aiopubsub.Subscriber(self.hub,self.name)
         subscriber.subscribe(self.name)
         self.set_status(200) # 200 OK http response
@@ -496,7 +658,7 @@ class MJpegHandler(tornado.web.RequestHandler):
                 break
             now = time.time()
             ta = ta_message[0]
-            print ("mjpeg",now-ta,ta)
+            #print ("mjpeg",now-ta,ta)
             self.write(("\r\n--BOUNDARY\r\nContent-Type: image/jpeg\r\nX-TimeDelta:%f\r\nLast-Modified: %s\r\nX-TimeStamp: %f\r\nContent-Length: %d\r\n\r\n" % (now-ta,DT.datetime.utcfromtimestamp(ta).isoformat(),ta,len(ta_message[1]))).encode("ascii"))
             yield self.write(ta_message[1])
             yield self.flush()
@@ -504,7 +666,7 @@ class MJpegHandler(tornado.web.RequestHandler):
         yield self.flush()
 
 
-def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate):
+def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate,gop=120,rtpbitrate=None,jpegquality=None,rtpcodec="h264",jpegcodec=None,rtpquality=None):
     nocrop = False
     args = ["ffmpeg"]
     if inputrate != 0:
@@ -513,11 +675,11 @@ def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate)
     if input == "screen":
         if sys.platform.startswith("win"):
             if False and len(parts) == 1: # optimize
-                pa = "-offset_x %d -offset_y %d -video_size %dx%d" % (parts[0],parts[1],parts[2],parts[3])
+                pa = ("-offset_x %d -offset_y %d -video_size %dx%d" % (parts[0],parts[1],parts[2],parts[3])).split(" ")
                 nocrop = True
             else:
-                pa = ''
-            command  = ['-f','gdigrab'] + [pa] + ['-i','desktop']
+                pa = []
+            command  = ['-f','gdigrab'] + pa + ['-i','desktop']
         else:   
             command = ['-f','avfoundation']
             if inputrate == 0:
@@ -556,18 +718,48 @@ def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate)
             if rtp:
                 args.append("-map")
                 args.append("[out%dA]" %i)
+                args.append("-vcodec")
+                args.append(rtpcodec)
+                if rtpquality is not None:
+                    args.append("-q:v")
+                    args.append("%d" % rtpquality)
+                if rtpbitrate is not None:
+                    args.append("-b:v")
+                    args.append(rtpbitrate)
+                if gop != 0:
+                    args.extend(["-g","%d" %gop])
+                if rtpcodec.startswith("h264"):
+                    args.extend("-bf 0 -preset ultrafast -tune zerolatency".split(" "))
+                    if rtpcodec == "h264" or rtpcodec == "libx264":
+                        args.extend("-x264-params scenecut=0".split(" "))
+                elif rtpcodec.startswith("mpeg4"):
+                    args.append("-bf")
+                    args.append("0")
                 args.append("-f")
                 args.append("rtp")
                 args.append("-sdp_file")
                 args.append(listeners[i]["sdp"])
                 if rtpopts != "":
                     args.append(rtpopts)
+                #JPEG for RTP -> vsample bug if using -f rtp
+                #
+                #http://www.ingerop.fr/sites/all/libraries/ffmpeg/libavformat/rtpenc_jpeg.c
+                #https://trac.ffmpeg.org/ticket/4709
+                #
+                # RFC 2435 requires 4:2:2 mjpeg over rtp to be encoded with vsample[] 1,1,1 not 2,2,2
+                # https://tools.ietf.org/html/rfc2435
                 args.append("rtp://127.0.0.1:%d" % listeners[i]["rtp"])
             if jpeg:
                 args.append("-map")
                 args.append("[out%dB]"% i)
                 args.append("-f")
                 args.append("mjpeg")
+                if jpegcodec is not None:
+                    args.append("-vcodec")
+                    args.append("%s" % jpegcodec)                    
+                if jpegquality is not None:
+                    args.append("-q:v")
+                    args.append("%d" % jpegquality)
                 if jpegopts != "":
                     args.append(jpegopts)
                 if listeners[i]["jpeg"][0] == "tcp":
@@ -586,14 +778,25 @@ def main():
     parser.add_argument('--rtsp',type=int,default=8666,help="rtsp port, use 0 for disabled (default 8666)")
     parser.add_argument('--rtp', type=str2bool, nargs='?',
                             const=True, default=True,help="enables RTP (default on)")
+    parser.add_argument('--verbose', type=str2bool, nargs='?',
+                            const=True, default=False,help="verbose")
+    parser.add_argument('--gop', default=120,type=int,help="grouping for keyframe")
+    parser.add_argument('--hwaccel', type=str2bool, nargs='?',
+                            const=True, default=False,help="hwaccel for Intel QSV")
+    parser.add_argument('--rtpcodec',default="mpeg4",help="rtp codec, e.g. mpeg4 or h264, note that mjpeg is not supported")
+    parser.add_argument('--rtpbitrate',default=None,help="bitrate e.g. 300k")
     parser.add_argument('--jpeg', type=str2bool, nargs='?',
                             const=True, default=True,help="enables JPEG (default on)")
-    parser.add_argument('--jpegopts',help="extra mjpeg options for ffmpeg (e.g. quality)",default="")
-    parser.add_argument('--rtpopts',help="extra rtp options for ffmpeg (e.g. encoder)",default="")
+    parser.add_argument('--jpegquality', help="quality 2-31 passed -q:v",default=None,type=int)
+    parser.add_argument('--rtpquality', help="quality 2-31 passed -q:v",default=None,type=int)
+    parser.add_argument('--jpegopts',help="extra mjpeg options for ffmpeg: use ffmpeg -h encoder=mjpeg",default="")
+    parser.add_argument('--rtpopts',help="extra rtp options for ffmpeg: use ffmpeg -h encoder=mpeg4 or h264",default="")
     parser.add_argument('--inputrate',help="grabbing rate (Hz) as -r to be put for the input (default 0)",default=0,type=int)
     parser.add_argument('--input',help="input value. Use 'screen' for desktop otherwise the ffmpeg input comprising the -i (default screen)",default="screen")
     parser.add_argument('--preferhttp',type=str2bool, nargs='?',
                             const=True, default=True,help="prefer http for internal connection with ffmpeg")
+    parser.add_argument('--quittable',type=str2bool, nargs='?',
+                            const=True, default=True,help="allow quitting")
     args = parser.parse_args()
 
     if not args.jpeg and not args.rtp:
@@ -632,6 +835,9 @@ def main():
             handlers.append((r"/rtp%d/([^/]+)/(\d+)" % i, RTPHandler, dict(hub=hub,name=("area%d"%i,"rtp"),udppublishers=udppublishers)))
             handlers.append((r"/sdp%d/([^/]+)/(\d+)" % i, SDPHandlerCustom, dict(filename=sdpfilename)))
             handlers.append((r"/sdp%d" % i, SDPHandler, dict(filename=sdpfilename)))
+            handlers.append((r"/rtp%d" % i, RTPChunkedHandler, dict(hub=hub,name=("area%d"%i,"rtp"),udppublishers=udppublishers)))
+            handlers.append((r"/rtpws%d" % i, RTPWSHandler, dict(hub=hub,name=("area%d"%i,"rtp"),udppublishers=udppublishers)))
+            handlers.append((r"/rtpdump%d" % i, RTPDumpHandler, dict(hub=hub,name=("area%d"%i,"rtp"),udppublishers=udppublishers)))
             holder.rtppub = rtppub
 
         if args.jpeg:
@@ -652,10 +858,12 @@ def main():
             # publis image
             handlers.append(("/jpeg%d" % i, JpegHandler, dict(hub=hub,name=("area%d"%i,"jpeg"))))
             handlers.append(("/mjpeg%d" % i, MJpegHandler, dict(hub=hub,name=("area%d"%i,"jpeg"))))
-    
+    if args.quittable:
+        handlers.append(("/quit",QuitHandler))
+
     print ("preparing  ffmpegg")
     print (listeners)
-    syntax = makeffmpeg_screen(args.input,parts,listeners,args.rtp,args.jpeg,args.rtpopts,args.jpegopts,args.inputrate)
+    syntax = makeffmpeg_screen(args.input,parts,listeners,args.rtp,args.jpeg,args.rtpopts,args.jpegopts,args.inputrate,rtpbitrate=args.rtpbitrate,rtpcodec="h264_qsv" if (args.rtpcodec == "h264" and args.hwaccel) else args.rtpcodec,rtpquality=args.rtpquality,jpegquality=args.jpegquality,jpegcodec="mjpeg_qs" if args.hwaccel else None)
 
     print (syntax)
     print (" ".join(syntax))
@@ -680,7 +888,7 @@ def main():
         cserver = RTCPServer(rserver)
         cserver.listen(args.rtsp+1)
     signal.signal(signal.SIGINT, lambda x, y: IOLoop.instance().stop())
-    IOLoop.instance().spawn_callback(lambda: startffmpeg(syntax))
+    IOLoop.instance().spawn_callback(lambda: startffmpeg(syntax,args.verbose))
     print ("loop starting")
     IOLoop.instance().start()
 
