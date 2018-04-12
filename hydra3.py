@@ -67,6 +67,71 @@ def parseH264header(packet):
     # packet is padded to be aligned
     else:
         return dict(discardableNRI=NRI,nalutype=NALUtype,body=packet[1:])
+
+def parseRTCP1(packet):
+    """Parses RTCP packet focusing on BYE, RR and APP"""
+    #https://en.wikipedia.org/wiki/RTP_Control_Protocol
+    e = struct.unpack(">BBH",packet[:4])
+    
+    if (e[0]>>6) != 2:       # check version is 2
+        return packet,None
+
+    hasPadding   = e[0] & 0x20
+    RC = e[0] & 0x1F
+    PT = e[1]
+    if PT == 200:
+        PTname = "sender report"
+    elif PT == 201:
+        PTname = "receiver report"
+    elif PT == 203:
+        PTname = "bye"
+    elif PT == 204:
+        PTname = "app"
+    else:
+        PTname = "unknown"
+    length = e[2] 
+    # The length of this RTCP packet in 32-bit words minus one, including the header and any padding
+    # 0 is valid
+    ssrc = e[3]
+    out = dict(hasPadding=hasPadding,RC=RC,PT=PT,PTname=PTname,length=length)
+
+    if PT == 201:
+        #http://www.freesoft.org/CIE/RFC/1889/19.htm
+        rr = []
+        out["ssrc"] = struct.unpack(">I",packet[4:8])[0]
+        out["rr"] = rr
+        xpacket = packet[8:]
+        for i in range(0,RC):
+            e = struct.unpack(">IIIIII",xpacket[:24])
+            ssrc = e[0]
+            fractionlost = (e[1] & 0xF000) >> 24
+            cumulativelost = (e[1] & 0x0FFF)
+            rr.append(dict(ssrc=e[0],fractionlost=fractionlost,seqmax=e[2],interjitter=e[3],lastSR=e[4],cumulativelost=cumulativelost))
+            xpacket = xpacket[24:]
+    elif PT == 203:
+        #http://www.freesoft.org/CIE/RFC/1889/32.htm
+        # list of SSRC counted as RC
+        bye = []
+        out["bye"] = struct.unpack(">"+("I"*RC),packet[4:4+RC*4]) if RC > 0 else []
+    elif PT == 204:
+        #http://www.freesoft.org/CIE/RFC/1889/33.htm
+        # name ASCII
+        # content
+        out["app"] = dict(name=packet[8:12],subtype=RC,content=packet[12:(length+1)*4])
+    # other typsr ignored
+    return out
+
+def parseRTCP(packet):
+    """Parses a compount RTCP. By standard packets ca be composed"""
+    r = []
+    while(packet != ""):
+        q = parseRTCP1(packet)
+        if q is None:
+            break
+        r.append(q)
+        # length is 32nit aligend and ...
+        packet = packet[(q["length"]+1)*4:]
+    return r
 def parsePacket(packet):
     # from https://github.com/sparkslabs/kamaelia
     e = struct.unpack(">BBHII",packet[:12])
@@ -756,7 +821,9 @@ def makeffmpeg_screen(input,parts,listeners,rtp,jpeg,rtpopts,jpegopts,inputrate,
                 args.append("mjpeg")
                 if jpegcodec is not None:
                     args.append("-vcodec")
-                    args.append("%s" % jpegcodec)                    
+                    args.append("%s" % jpegcodec)       
+                args.append("-pix_fmt")
+                args.append("yuvj422p")             
                 if jpegquality is not None:
                     args.append("-q:v")
                     args.append("%d" % jpegquality)
